@@ -1,0 +1,14 @@
+{
+  "_comment": "Map plain text to platform-specific replacements. Omit a platform key to leave that platform's text unchanged.",
+  "substitutions": [
+    {
+      "match": "Veronika",
+      "instagram": "@veronika_ker"
+    },
+    {
+      "match": "Zatsepi Coffee",
+      "vk": "@zatsepi_coffee",
+      "instagram": "@zatsepi.krd"
+    }
+  ]
+}
