@@ -1,16 +1,15 @@
 """
 Telegram bot entry point.
 
-Usage: forward any post from your channel to this bot.
+Two ways to trigger a repost:
 
-The bot will:
-  1. Collect all messages in the forwarded post (handles albums)
-  2. Apply platform-specific text substitutions
-  3. Post to VK and Instagram
-  4. Reply with status + links
+1. Forward a post from your channel to the bot.
+2. Send a video (or document) directly to the bot with the post text as the caption.
+   Use /post to trigger — the bot waits for you to attach a video + caption.
 """
 import asyncio
 import logging
+import os
 import shutil
 from collections import defaultdict
 
@@ -40,6 +39,9 @@ _album_buffers: dict[str, list] = defaultdict(list)
 _album_tasks: dict[str, asyncio.Task] = {}
 _ALBUM_WAIT = 1.5  # seconds to wait for all album parts to arrive
 
+# Users who have issued /post and are waiting to send a video
+_awaiting_direct_post: set[int] = set()
+
 
 def _auth_check(user_id: int) -> bool:
     return user_id == config.TELEGRAM_ALLOWED_USER_ID
@@ -53,7 +55,18 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not _auth_check(update.effective_user.id):
         return
     await update.message.reply_text(
-        "Hi! Forward any post from your channel and I'll repost it to VK and Instagram."
+        "Hi! Two ways to repost:\n\n"
+        "1. Forward a channel post to me.\n"
+        "2. Send /post — then attach a video with the caption as your post text."
+    )
+
+
+async def cmd_post(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not _auth_check(update.effective_user.id):
+        return
+    _awaiting_direct_post.add(update.effective_user.id)
+    await update.message.reply_text(
+        "Ready. Send me a video (or file) with the post text as the caption."
     )
 
 
@@ -62,9 +75,19 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return
 
     message = update.effective_message
+    user_id = update.effective_user.id
 
+    # --- Direct post mode: user sent /post and is now sending a video ---
+    if user_id in _awaiting_direct_post and (message.video or message.document):
+        _awaiting_direct_post.discard(user_id)
+        await _repost(message, [message], context)
+        return
+
+    # --- Forwarded channel post ---
     if not message.forward_origin:
-        await message.reply_text("Please forward a channel post to me.")
+        await message.reply_text(
+            "Please forward a channel post, or use /post to send a video directly."
+        )
         return
 
     media_group_id = message.media_group_id
@@ -103,8 +126,13 @@ async def _repost(
         await status_msg.edit_text(f"Failed to read post:\n{exc}")
         return
 
+    media_info = ""
+    for path, mtype in zip(post.media_paths, post.media_types):
+        size_mb = os.path.getsize(path) / 1024 / 1024
+        media_info += f"\n  {mtype}: {size_mb:.1f} MB → {path}"
+
     await status_msg.edit_text(
-        f"Fetched: {len(post.text)} chars, {len(post.media_paths)} media file(s).\n"
+        f"Fetched: {len(post.text)} chars, {len(post.media_paths)} media file(s).{media_info}\n\n"
         "Posting to VK and Instagram..."
     )
 
@@ -150,14 +178,15 @@ def main() -> None:
     )
 
     app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("post", cmd_post))
     app.add_handler(
         MessageHandler(
-            filters.TEXT | filters.FORWARDED | filters.CAPTION | filters.PHOTO | filters.VIDEO,
+            filters.TEXT | filters.FORWARDED | filters.CAPTION | filters.PHOTO | filters.VIDEO | filters.Document.VIDEO,
             handle_message,
         )
     )
 
-    log.info("Bot started. Waiting for forwarded messages...")
+    log.info("Bot started. Waiting for messages...")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
