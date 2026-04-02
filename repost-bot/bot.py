@@ -8,9 +8,11 @@ Two ways to trigger a repost:
    Use /post to trigger — the bot waits for you to attach a video + caption.
 """
 import asyncio
+import json
 import logging
 import os
 import shutil
+import subprocess
 from collections import defaultdict
 
 from telegram import Update
@@ -42,6 +44,9 @@ _ALBUM_WAIT = 1.5  # seconds to wait for all album parts to arrive
 # Users who have issued /post and are waiting to send a video
 _awaiting_direct_post: set[int] = set()
 
+# Debug mode: skip API calls, keep temp files, report video metadata
+_debug_mode: bool = False
+
 
 def _auth_check(user_id: int) -> bool:
     return user_id == config.TELEGRAM_ALLOWED_USER_ID
@@ -67,6 +72,19 @@ async def cmd_post(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     _awaiting_direct_post.add(update.effective_user.id)
     await update.message.reply_text(
         "Ready. Send me a video (or file) with the post text as the caption."
+    )
+
+
+async def cmd_debug_toggle(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    global _debug_mode
+    if not _auth_check(update.effective_user.id):
+        return
+    _debug_mode = not _debug_mode
+    state = "ON" if _debug_mode else "OFF"
+    await update.message.reply_text(
+        f"Debug mode is now {state}.\n"
+        + ("API calls will be SKIPPED. Temp files will NOT be deleted." if _debug_mode
+           else "Normal operation restored.")
     )
 
 
@@ -112,6 +130,74 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await _repost(message, [message], context)
 
 
+def _temp_dir_of(media_paths: list) -> str:
+    if not media_paths:
+        return "(no media downloaded)"
+    return str(media_paths[0]).rsplit("/", 1)[0]
+
+
+def _ffprobe_info(path: str) -> str:
+    """Return formatted video metadata from ffprobe, or a fallback string."""
+    cmd = [
+        "ffprobe", "-v", "quiet",
+        "-print_format", "json",
+        "-show_streams", "-show_format",
+        path,
+    ]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
+    except FileNotFoundError:
+        return "    (ffprobe not available)"
+    except subprocess.TimeoutExpired:
+        return "    (ffprobe timed out)"
+
+    if result.returncode != 0:
+        return f"    (ffprobe error: {result.stderr.strip()[:120]})"
+
+    try:
+        data = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        return "    (ffprobe output unparseable)"
+
+    lines = []
+    video_stream = next(
+        (s for s in data.get("streams", []) if s.get("codec_type") == "video"),
+        None,
+    )
+    if video_stream:
+        codec = video_stream.get("codec_name", "unknown")
+        width = video_stream.get("width", "?")
+        height = video_stream.get("height", "?")
+        lines.append(f"    Resolution: {width}x{height}, codec: {codec}")
+
+        pix_fmt = video_stream.get("pix_fmt")
+        if pix_fmt:
+            lines.append(f"    Pixel format: {pix_fmt}")
+
+        color_space = video_stream.get("color_space")
+        color_transfer = video_stream.get("color_transfer")
+        color_primaries = video_stream.get("color_primaries")
+        color_parts = [x for x in [color_space, color_transfer, color_primaries] if x]
+        if color_parts:
+            lines.append(f"    Color: {' / '.join(color_parts)}")
+
+        profile = video_stream.get("profile")
+        level = video_stream.get("level")
+        if profile or level:
+            level_str = f"{level / 10:.1f}" if isinstance(level, int) else str(level)
+            lines.append(f"    Profile: {profile or '?'}, level: {level_str}")
+
+    fmt = data.get("format", {})
+    duration = fmt.get("duration")
+    bit_rate = fmt.get("bit_rate")
+    if duration:
+        lines.append(f"    Duration: {float(duration):.1f}s")
+    if bit_rate:
+        lines.append(f"    Bitrate: {int(bit_rate) // 1000} kbps")
+
+    return "\n".join(lines) if lines else "    (no usable metadata)"
+
+
 async def _repost(
     reply_to,  # message to reply status updates to
     messages: list,
@@ -126,6 +212,36 @@ async def _repost(
         await status_msg.edit_text(f"Failed to read post:\n{exc}")
         return
 
+    vk_text = transformer.transform(post.text, "vk")
+    ig_text = transformer.transform(post.text, "instagram")
+
+    # --- Debug mode: report and bail out without posting ---
+    if _debug_mode:
+        lines = ["[DEBUG MODE — no posting was done]\n"]
+        lines.append(f"Temp dir: {_temp_dir_of(post.media_paths)}")
+        lines.append(f"Text chars (original): {len(post.text)}")
+        lines.append(f"Media files: {len(post.media_paths)}\n")
+
+        for path, mtype in zip(post.media_paths, post.media_types):
+            size_mb = os.path.getsize(path) / 1024 / 1024
+            lines.append(f"  [{mtype.upper()}] {path}")
+            lines.append(f"    Size: {size_mb:.2f} MB")
+            if mtype == "video":
+                lines.append(_ffprobe_info(path))
+            lines.append("")
+
+        lines.append(f"VK text ({len(vk_text)} chars):\n{vk_text}\n")
+        lines.append(f"Instagram text ({len(ig_text)} chars):\n{ig_text}\n")
+        lines.append("Temp files kept on disk (not cleaned up).")
+
+        report = "\n".join(lines)
+        if len(report) > 4000:
+            report = report[:3950] + "\n\n[... truncated — see temp dir for full files]"
+        await status_msg.edit_text(report)
+        log.info("Debug run complete. Temp dir retained: %s", _temp_dir_of(post.media_paths))
+        return
+
+    # --- Normal mode ---
     media_info = ""
     for path, mtype in zip(post.media_paths, post.media_types):
         size_mb = os.path.getsize(path) / 1024 / 1024
@@ -140,7 +256,6 @@ async def _repost(
 
     # --- VK ---
     try:
-        vk_text = transformer.transform(post.text, "vk")
         vk_url = vk_poster.post_to_vk(post, vk_text)
         results.append(f"VK: {vk_url}")
         log.info("Posted to VK: %s", vk_url)
@@ -150,7 +265,6 @@ async def _repost(
 
     # --- Instagram ---
     try:
-        ig_text = transformer.transform(post.text, "instagram")
         ig_url = ig_poster.post_to_instagram(post, ig_text)
         results.append(f"Instagram: {ig_url}")
         log.info("Posted to Instagram: %s", ig_url)
@@ -179,6 +293,7 @@ def main() -> None:
 
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("post", cmd_post))
+    app.add_handler(CommandHandler("debug_toggle", cmd_debug_toggle))
     app.add_handler(
         MessageHandler(
             filters.TEXT | filters.FORWARDED | filters.CAPTION | filters.PHOTO | filters.VIDEO | filters.Document.VIDEO,
